@@ -12,7 +12,8 @@ Photo Curator is a single-file PyQt5 desktop application for curating large phot
 # Run the app
 python photo_curator.py
 
-# Build standalone .exe with PyInstaller (single-file, no console)
+# Build standalone binary with PyInstaller (single-file, no console)
+# Produces dist/PhotoCurator (binary) and dist/PhotoCurator.app (macOS bundle)
 pyinstaller PhotoCurator.spec
 
 # Install dependencies (only PyQt5 is needed at runtime)
@@ -29,8 +30,9 @@ The entire application lives in `photo_curator.py` (~1478 lines). There are no t
 
 - **`PhotoCurator(QMainWindow)`** — Main window with a 3-page `QStackedWidget`: setup (page 0), curator (page 1), results (page 2). Manages round-based curation state, session persistence, and all UI logic.
 - **`ZoomableImageView(QGraphicsView)`** — Single-photo viewer with mouse wheel zoom, drag-pan, fit-to-view, and original-size modes.
-- **`ThumbLoaderWorker(QThread)`** — Background thread that batch-loads thumbnails and emits `thumb_ready` signals.
-- **`ThumbnailCache`** — LRU cache (OrderedDict, max 600 entries) for thumbnail pixmaps.
+- **`FullImageLoader(QThread)`** — Background thread for loading a single full-resolution image; emits `finished(path, pixmap)`. Previous loader is cancelled before starting a new one.
+- **`ThumbLoaderWorker(QThread)`** — Background thread that batch-loads thumbnails and emits `thumb_ready(path, small_pixmap, grid_pixmap)` signals.
+- **`ThumbnailCache`** — LRU cache (OrderedDict, max 1080 entries) for thumbnail pixmaps. Two instances exist: `thumb_cache` (80px queue thumbnails) and `grid_thumb_cache` (400px grid thumbnails).
 - **`QueueThumbnail(QLabel)`** — Bottom filmstrip thumbnail items with current/selected state rendering via QPainter.
 - **`ClickableThumbnail(QLabel)`** — Grid view thumbnail items with click/double-click signals.
 - **`DropZoneList(QListWidget)`** — Drag-and-drop zone for adding photo folders/files on the setup page.
@@ -54,9 +56,7 @@ The entire application lives in `photo_curator.py` (~1478 lines). There are no t
 
 ### Thumbnail preloading strategy
 
-- Initial preload: first 40 photos (`PRELOAD_INITIAL`)
-- Dynamic preload: 15 ahead of current position (`PRELOAD_AHEAD`), 5 behind
-- Previous loader is cancelled before starting a new one
+`_preload_all_thumbs(center_idx)` loads all uncached thumbnails sorted by proximity to the current position (nearest first). The previous `ThumbLoaderWorker` is cancelled before starting a new one. Full-resolution images are loaded on-demand by `FullImageLoader` when navigating to a photo.
 
 ### Supported image formats
 

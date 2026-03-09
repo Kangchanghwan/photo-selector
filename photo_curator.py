@@ -34,7 +34,8 @@ from PyQt5.QtWidgets import (
     QMessageBox, QStackedWidget, QScrollArea,
     QGridLayout, QSizePolicy, QShortcut, QGroupBox,
     QSlider, QCheckBox, QListWidget, QListWidgetItem,
-    QAbstractItemView, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
+    QAbstractItemView, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
+    QGraphicsOpacityEffect
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect, QSize, QRectF
 from PyQt5.QtGui import (
@@ -169,6 +170,52 @@ class ThumbnailCache:
 
     def clear(self):
         self._cache.clear()
+
+
+# ─────────────────────────────────────────────
+# 사진 뷰어 오버레이 컨테이너
+# ─────────────────────────────────────────────
+class PhotoOverlayContainer(QWidget):
+    """
+    사진 뷰어가 전체 영역을 차지하고, 컨트롤(버튼·큐·라벨)이
+    반투명 오버레이로 그 위에 절대 좌표로 배치되는 컨테이너.
+    resizeEvent 마다 자식 위젯들의 위치·크기를 재계산한다.
+    """
+    NAV_W, NAV_H = 48, 90        # 이전/다음 버튼
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        w, h = self.width(), self.height()
+
+        # 이미지 뷰어: 컨테이너 전체
+        iv = getattr(self, '_image_viewer', None)
+        if iv:
+            iv.setGeometry(0, 0, w, h)
+
+        # 이전/다음 버튼: 컨테이너 좌우 중앙
+        bw = self.NAV_W
+        bh = min(self.NAV_H, max(44, h - 120))
+        by = (h - bh) // 2
+        bp = getattr(self, '_btn_prev', None)
+        if bp:
+            bp.setGeometry(10, by, bw, bh)
+            bp.raise_()
+        bn = getattr(self, '_btn_next', None)
+        if bn:
+            bn.setGeometry(w - bw - 10, by, bw, bh)
+            bn.raise_()
+
+        # 파일명 라벨: 좌상단
+        il = getattr(self, '_info_label', None)
+        if il:
+            il.setGeometry(10, 10, w - 90, 24)
+            il.raise_()
+
+        # 줌 퍼센트 라벨: 우상단
+        zl = getattr(self, '_zoom_label', None)
+        if zl:
+            zl.setGeometry(w - 68, 10, 60, 22)
+            zl.raise_()
 
 
 # ─────────────────────────────────────────────
@@ -456,6 +503,7 @@ class PhotoCurator(QMainWindow):
         self.resize(1300, 850)
         self.setAcceptDrops(True)
         self._full_loader = None  # 현재 실행 중인 고해상도 로더 저장
+        self._pending_loaders = []  # 취소됐지만 아직 실행 중인 로더 (GC 방지용)
 
         self.source_entries = []
         self.all_photos = []
@@ -473,6 +521,10 @@ class PhotoCurator(QMainWindow):
         self._resize_timer.setSingleShot(True)
         self._resize_timer.timeout.connect(self._on_resize_done)
 
+        self._nav_debounce_timer = QTimer(self)
+        self._nav_debounce_timer.setSingleShot(True)
+        self._nav_debounce_timer.timeout.connect(self._on_nav_debounced)
+
         # 썸네일 캐시 & 로더
         self.thumb_cache = ThumbnailCache(max_size=1080)       # 큐용 (작은 썸네일)
         self.grid_thumb_cache = ThumbnailCache(max_size=1080)  # 그리드용 (큰 썸네일)
@@ -481,6 +533,7 @@ class PhotoCurator(QMainWindow):
         self._apply_dark_theme()
         self._build_ui()
         self._setup_shortcuts()
+        self._check_saved_session()
 
     def dragEnterEvent(self, event):
         if self.stack.currentIndex() == 0 and event.mimeData().hasUrls():
@@ -637,12 +690,18 @@ class PhotoCurator(QMainWindow):
         layout.addWidget(target_group)
 
         btn_row = QHBoxLayout()
+        resume_col = QVBoxLayout()
         self.btn_resume = QPushButton("📂 이전 세션 이어서 하기")
         self.btn_resume.setFixedHeight(42)
         self.btn_resume.clicked.connect(self._resume_session)
         self.btn_resume.setStyleSheet(
             "QPushButton{background:#1a472a;border-color:#2d6a4f}QPushButton:hover{background:#2d6a4f}")
-        btn_row.addWidget(self.btn_resume)
+        resume_col.addWidget(self.btn_resume)
+        self.session_info_label = QLabel("")
+        self.session_info_label.setStyleSheet("color:#4ecca3;font-size:11px;")
+        self.session_info_label.setAlignment(Qt.AlignCenter)
+        resume_col.addWidget(self.session_info_label)
+        btn_row.addLayout(resume_col)
         btn_row.addSpacing(20)
         self.btn_start = QPushButton("🚀 선별 시작!")
         self.btn_start.setFixedHeight(50)
@@ -732,143 +791,132 @@ class PhotoCurator(QMainWindow):
     def _build_curator_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(6)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(3)
 
-        # 상단 정보 바
+        # ── 상단 정보 바 (compact) ──
         info_bar = QHBoxLayout()
+        info_bar.setSpacing(8)
         self.round_label = QLabel("라운드 1")
-        self.round_label.setFont(QFont("", 16, QFont.Bold))
+        self.round_label.setFont(QFont("", 13, QFont.Bold))
         self.round_label.setStyleSheet("color: #e94560;")
         info_bar.addWidget(self.round_label)
         info_bar.addStretch()
 
-        self.btn_view_single = QPushButton("🖼 1장 뷰")
+        self.btn_view_single = QPushButton("🖼 1장")
         self.btn_view_single.setCheckable(True)
         self.btn_view_single.setChecked(True)
-        self.btn_view_single.setFixedHeight(32)
-        self.btn_view_single.setStyleSheet("font-size:12px;padding:4px 12px")
+        self.btn_view_single.setFixedHeight(26)
+        self.btn_view_single.setStyleSheet("font-size:11px;padding:2px 10px")
         self.btn_view_single.clicked.connect(lambda: self._switch_view_mode(self.VIEW_SINGLE))
         info_bar.addWidget(self.btn_view_single)
 
-        self.btn_view_grid = QPushButton("▦ 그리드 뷰")
+        self.btn_view_grid = QPushButton("▦ 그리드")
         self.btn_view_grid.setCheckable(True)
-        self.btn_view_grid.setFixedHeight(32)
-        self.btn_view_grid.setStyleSheet("font-size:12px;padding:4px 12px")
+        self.btn_view_grid.setFixedHeight(26)
+        self.btn_view_grid.setStyleSheet("font-size:11px;padding:2px 10px")
         self.btn_view_grid.clicked.connect(lambda: self._switch_view_mode(self.VIEW_GRID))
         info_bar.addWidget(self.btn_view_grid)
 
-        info_bar.addSpacing(20)
+        info_bar.addSpacing(10)
         self.progress_label = QLabel("0 / 0")
-        self.progress_label.setFont(QFont("", 14))
+        self.progress_label.setFont(QFont("", 12))
         info_bar.addWidget(self.progress_label)
-        info_bar.addSpacing(15)
+        info_bar.addSpacing(8)
         self.selected_label = QLabel("선택: 0장")
-        self.selected_label.setFont(QFont("", 14))
+        self.selected_label.setFont(QFont("", 12))
         self.selected_label.setStyleSheet("color: #4ecca3;")
         info_bar.addWidget(self.selected_label)
+
+        info_bar.addSpacing(10)
+        self.btn_toggle = QPushButton("♡ 선택 (Space)")
+        self.btn_toggle.setFixedHeight(26)
+        self.btn_toggle.setStyleSheet(
+            "QPushButton{background:#27ae60;color:white;border:1px solid #2ecc71;"
+            "border-radius:6px;font-size:12px;font-weight:bold;padding:2px 14px}"
+            "QPushButton:hover{background:#2ecc71}")
+        self.btn_toggle.clicked.connect(self._toggle_select)
+        info_bar.addWidget(self.btn_toggle)
+
+        info_bar.addSpacing(10)
+        self.btn_finish_round = QPushButton("라운드 마치기 →")
+        self.btn_finish_round.clicked.connect(self._finish_round)
+        self.btn_finish_round.setFixedHeight(26)
+        self.btn_finish_round.setStyleSheet(
+            "QPushButton{background:#533483;border-color:#7c3aed;font-size:11px;padding:2px 12px}"
+            "QPushButton:hover{background:#7c3aed}")
+        info_bar.addWidget(self.btn_finish_round)
         layout.addLayout(info_bar)
 
         self.curator_progress = QProgressBar()
-        self.curator_progress.setFixedHeight(6)
+        self.curator_progress.setFixedHeight(4)
         self.curator_progress.setTextVisible(False)
         self.curator_progress.setStyleSheet(
-            "QProgressBar{border:none;background:#16213e;border-radius:3px}"
-            "QProgressBar::chunk{background:#e94560;border-radius:3px}")
+            "QProgressBar{border:none;background:#16213e;border-radius:2px}"
+            "QProgressBar::chunk{background:#e94560;border-radius:2px}")
         layout.addWidget(self.curator_progress)
 
-        # 뷰 스택
+        # ── 뷰 스택 ──
         self.view_stack = QStackedWidget()
         layout.addWidget(self.view_stack, 1)
 
-        # --- 1장 뷰 ---
-        single_widget = QWidget()
-        sl = QVBoxLayout(single_widget)
-        sl.setContentsMargins(0, 0, 0, 0)
-        sl.setSpacing(4)
+        # ── 1장 뷰: PhotoOverlayContainer ──
+        container = PhotoOverlayContainer()
 
-        # 확대/축소 가능한 이미지 뷰어
-        self.image_viewer = ZoomableImageView()
-        sl.addWidget(self.image_viewer, 1)
+        # 이미지 뷰어 (컨테이너 전체 채움, 레이아웃 없이 절대 좌표)
+        self.image_viewer = ZoomableImageView(container)
+        container._image_viewer = self.image_viewer
 
-        # 파일명 + 줌 컨트롤 바
-        info_row = QHBoxLayout()
-        info_row.setSpacing(8)
+        # 파일명 오버레이 (좌상단)
+        self.filename_label = QLabel("", container)
+        self.filename_label.setFont(QFont("", 10))
+        self.filename_label.setStyleSheet(
+            "color:#ddd; background-color:rgba(0,0,0,150);"
+            "border-radius:4px; padding:2px 8px;")
+        self.filename_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        container._info_label = self.filename_label
 
-        self.filename_label = QLabel("")
-        self.filename_label.setFont(QFont("", 11))
-        self.filename_label.setStyleSheet("color: #888;")
-        info_row.addWidget(self.filename_label)
-
-        self.source_path_label = QLabel("")
-        self.source_path_label.setFont(QFont("", 9))
-        self.source_path_label.setStyleSheet("color: #555;")
-        info_row.addWidget(self.source_path_label)
-
-        info_row.addStretch()
-
-        # 줌 컨트롤
-        zoom_style = "QPushButton{font-size:12px;padding:4px 8px;min-width:30px}"
-        btn_zoom_out = QPushButton("−")
-        btn_zoom_out.setStyleSheet(zoom_style)
-        btn_zoom_out.setFixedSize(32, 28)
-        btn_zoom_out.clicked.connect(self._zoom_out)
-        info_row.addWidget(btn_zoom_out)
-
-        self.zoom_label = QLabel("100%")
-        self.zoom_label.setFixedWidth(50)
+        # 줌 퍼센트 오버레이 (우상단)
+        self.zoom_label = QLabel("100%", container)
+        self.zoom_label.setFont(QFont("", 9))
+        self.zoom_label.setStyleSheet(
+            "color:#bbb; background-color:rgba(0,0,0,150);"
+            "border-radius:4px; padding:2px 6px;")
         self.zoom_label.setAlignment(Qt.AlignCenter)
-        self.zoom_label.setStyleSheet("color:#999;font-size:11px")
-        info_row.addWidget(self.zoom_label)
+        container._zoom_label = self.zoom_label
 
-        btn_zoom_in = QPushButton("+")
-        btn_zoom_in.setStyleSheet(zoom_style)
-        btn_zoom_in.setFixedSize(32, 28)
-        btn_zoom_in.clicked.connect(self._zoom_in)
-        info_row.addWidget(btn_zoom_in)
+        # source_path_label: 숨김 (하위 호환용)
+        self.source_path_label = QLabel("", container)
+        self.source_path_label.hide()
 
-        btn_fit = QPushButton("맞춤")
-        btn_fit.setStyleSheet("QPushButton{font-size:11px;padding:4px 8px}")
-        btn_fit.setFixedHeight(28)
-        btn_fit.clicked.connect(self._zoom_fit)
-        info_row.addWidget(btn_fit)
-
-        btn_orig = QPushButton("원본")
-        btn_orig.setStyleSheet("QPushButton{font-size:11px;padding:4px 8px}")
-        btn_orig.setFixedHeight(28)
-        btn_orig.clicked.connect(self._zoom_original)
-        info_row.addWidget(btn_orig)
-
-        sl.addLayout(info_row)
-
-        # 버튼: ← 이전 | Space 선택 토글 | → 다음
-        bl = QHBoxLayout()
-        bl.setSpacing(15)
-
-        self.btn_prev = QPushButton("⬅ 이전 (←)")
-        self.btn_prev.setFixedHeight(50)
-        self.btn_prev.clicked.connect(self._go_previous)
+        # 이전 버튼 (좌측 오버레이)
+        self.btn_prev = QPushButton("◀", container)
         self.btn_prev.setStyleSheet(
-            "QPushButton{background:#2a2a3e;font-size:14px}QPushButton:hover{background:#3a3a4e}")
-        bl.addWidget(self.btn_prev)
+            "QPushButton{background:rgba(0,0,0,160);color:rgba(255,255,255,200);"
+            "border:1px solid rgba(255,255,255,50);border-radius:6px;font-size:20px}"
+            "QPushButton:hover{background:rgba(60,60,120,220);color:white}")
+        self.btn_prev.clicked.connect(self._go_previous)
+        eff_prev = QGraphicsOpacityEffect()
+        eff_prev.setOpacity(0.75)
+        self.btn_prev.setGraphicsEffect(eff_prev)
+        container._btn_prev = self.btn_prev
 
-        self.btn_toggle = QPushButton("♡ 선택 (Space)")
-        self.btn_toggle.setFixedHeight(55)
-        self.btn_toggle.clicked.connect(self._toggle_select)
-        bl.addWidget(self.btn_toggle, 2)
-
-        self.btn_next = QPushButton("다음 (→) ➡")
-        self.btn_next.setFixedHeight(50)
-        self.btn_next.clicked.connect(self._go_next)
+        # 다음 버튼 (우측 오버레이)
+        self.btn_next = QPushButton("▶", container)
         self.btn_next.setStyleSheet(
-            "QPushButton{background:#2a2a3e;font-size:14px}QPushButton:hover{background:#3a3a4e}")
-        bl.addWidget(self.btn_next)
-        sl.addLayout(bl)
+            "QPushButton{background:rgba(0,0,0,160);color:rgba(255,255,255,200);"
+            "border:1px solid rgba(255,255,255,50);border-radius:6px;font-size:20px}"
+            "QPushButton:hover{background:rgba(60,60,120,220);color:white}")
+        self.btn_next.clicked.connect(self._go_next)
+        eff_next = QGraphicsOpacityEffect()
+        eff_next.setOpacity(0.75)
+        self.btn_next.setGraphicsEffect(eff_next)
+        container._btn_next = self.btn_next
 
-        # ── 하단 썸네일 큐 ──
+        # 썸네일 큐 (별도 영역 - 사진 아래 고정)
         queue_container = QWidget()
-        queue_container.setFixedHeight(THUMB_SIZE + 16)
-        queue_container.setStyleSheet("background-color: #0d0d1f; border-radius: 8px;")
+        queue_container.setFixedHeight(THUMB_SIZE + 18)
+        queue_container.setStyleSheet("background-color: #0d0d1f;")
         ql = QHBoxLayout(queue_container)
         ql.setContentsMargins(4, 4, 4, 4)
         ql.setSpacing(0)
@@ -879,21 +927,23 @@ class PhotoCurator(QMainWindow):
         self.queue_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.queue_scroll.setStyleSheet(
             "QScrollArea{background:transparent;border:none}"
-            "QScrollBar:horizontal{height:6px;background:transparent}"
-            "QScrollBar::handle:horizontal{background:#333;border-radius:3px}")
+            "QScrollBar:horizontal{height:4px;background:transparent}"
+            "QScrollBar::handle:horizontal{background:#444;border-radius:2px}")
 
         self.queue_widget = QWidget()
+        self.queue_widget.setStyleSheet("background:transparent;")
         self.queue_layout = QHBoxLayout(self.queue_widget)
         self.queue_layout.setContentsMargins(4, 0, 4, 0)
         self.queue_layout.setSpacing(4)
         self.queue_scroll.setWidget(self.queue_widget)
 
         ql.addWidget(self.queue_scroll)
-        sl.addWidget(queue_container)
 
-        self.view_stack.addWidget(single_widget)
+        self.view_stack.addWidget(container)
+        self.queue_container = queue_container
+        layout.addWidget(queue_container)
 
-        # --- 그리드 뷰 ---
+        # ── 그리드 뷰 ──
         grid_container = QWidget()
         gl = QVBoxLayout(grid_container)
         gl.setContentsMargins(0, 0, 0, 0)
@@ -935,16 +985,6 @@ class PhotoCurator(QMainWindow):
         gl.addWidget(self.grid_scroll, 1)
         self.view_stack.addWidget(grid_container)
 
-        # 공통 하단
-        bottom_bar = QHBoxLayout()
-        bottom_bar.addStretch()
-        self.btn_finish_round = QPushButton("이 라운드 마치기 →")
-        self.btn_finish_round.clicked.connect(self._finish_round)
-        self.btn_finish_round.setStyleSheet(
-            "QPushButton{background:#533483;border-color:#7c3aed;font-size:13px;padding:8px 20px}"
-            "QPushButton:hover{background:#7c3aed}")
-        bottom_bar.addWidget(self.btn_finish_round)
-        layout.addLayout(bottom_bar)
         self.stack.addWidget(page)
 
     # ══════════════════════════════════
@@ -1042,6 +1082,9 @@ class PhotoCurator(QMainWindow):
         self.view_stack.setCurrentIndex(mode)
         self.btn_view_single.setChecked(mode == self.VIEW_SINGLE)
         self.btn_view_grid.setChecked(mode == self.VIEW_GRID)
+        is_single = mode == self.VIEW_SINGLE
+        self.btn_toggle.setVisible(is_single)
+        self.queue_container.setVisible(is_single)
         if mode == self.VIEW_GRID:
             self._populate_grid()
         else:
@@ -1084,10 +1127,15 @@ class PhotoCurator(QMainWindow):
                 w.set_state(w.index == self.current_index, path in self.selected_photos)
 
     def _scroll_queue_to_current(self):
-        """현재 사진이 큐에서 보이도록 스크롤"""
-        if self.current_index < len(self._queue_widgets):
-            widget = self._queue_widgets[self.current_index]
-            self.queue_scroll.ensureWidgetVisible(widget, 50, 0)
+        """현재 사진이 큐 가운데에 오도록 스크롤"""
+        def do_scroll():
+            if self.current_index < len(self._queue_widgets):
+                widget = self._queue_widgets[self.current_index]
+                widget_center_x = widget.x() + widget.width() // 2
+                viewport_half = self.queue_scroll.viewport().width() // 2
+                scroll_x = widget_center_x - viewport_half
+                self.queue_scroll.horizontalScrollBar().setValue(scroll_x)
+        QTimer.singleShot(0, do_scroll)
 
     def _on_queue_click(self, index):
         """큐 썸네일 클릭 → 해당 사진으로 이동"""
@@ -1123,10 +1171,24 @@ class PhotoCurator(QMainWindow):
         if not paths_to_load:
             return
 
-        # 이전 로더가 있으면 취소
+        # 이전 로더가 있으면 취소 후 안전하게 정리 (_pending_loaders로 참조 유지)
         if self._thumb_loader and self._thumb_loader.isRunning():
             self._thumb_loader.cancel()
-            self._thumb_loader.wait(500)
+            try:
+                self._thumb_loader.thumb_ready.disconnect()
+                self._thumb_loader.batch_done.disconnect()
+            except TypeError:
+                pass
+            old_thumb = self._thumb_loader
+            self._pending_loaders.append(old_thumb)
+            def _cleanup_thumb(old_thumb=old_thumb):
+                try:
+                    self._pending_loaders.remove(old_thumb)
+                except ValueError:
+                    pass
+                old_thumb.deleteLater()
+            old_thumb.finished.connect(lambda: _cleanup_thumb())
+            self._thumb_loader = None
 
         self._thumb_loader = ThumbLoaderWorker(paths_to_load)
         self._thumb_loader.thumb_ready.connect(self._on_thumb_loaded)
@@ -1259,12 +1321,43 @@ class PhotoCurator(QMainWindow):
         except Exception:
             pass
 
-    def _resume_session(self):
-        fp, _ = QFileDialog.getOpenFileName(self, "세션 파일 선택", "", "JSON (*.json)")
-        if not fp:
+    def _check_saved_session(self):
+        """앱 시작 시 저장된 세션이 있으면 버튼에 정보를 표시한다."""
+        if not os.path.exists(self.session_file):
+            self.btn_resume.setEnabled(False)
+            self.session_info_label.setText("저장된 세션 없음")
+            self.session_info_label.setStyleSheet("color:#666;font-size:11px;")
             return
         try:
-            with open(fp, 'r', encoding='utf-8') as f:
+            with open(self.session_file, 'r', encoding='utf-8') as f:
+                s = json.load(f)
+            saved_at = s.get("saved_at", "")
+            round_num = s.get("round_number", 1)
+            total = len(s.get("current_round_photos", []))
+            selected = len(s.get("selected_photos", []))
+            idx = s.get("current_index", 0)
+            # 날짜/시간 포맷
+            try:
+                dt = datetime.fromisoformat(saved_at)
+                time_str = dt.strftime("%m/%d %H:%M")
+            except Exception:
+                time_str = saved_at[:16] if saved_at else "?"
+            self.session_info_label.setText(
+                f"라운드 {round_num} | {idx+1}/{total}장 진행 | 선택 {selected}장 | 저장: {time_str}")
+            self.session_info_label.setStyleSheet("color:#4ecca3;font-size:11px;")
+            self.btn_resume.setEnabled(True)
+        except Exception:
+            self.btn_resume.setEnabled(False)
+            self.session_info_label.setText("세션 파일 읽기 실패")
+            self.session_info_label.setStyleSheet("color:#e74c3c;font-size:11px;")
+
+    def _resume_session(self):
+        """자동 저장된 세션 파일에서 바로 불러온다."""
+        if not os.path.exists(self.session_file):
+            QMessageBox.information(self, "세션 없음", "저장된 세션이 없습니다.")
+            return
+        try:
+            with open(self.session_file, 'r', encoding='utf-8') as f:
                 s = json.load(f)
             self.source_entries = s.get("source_entries", [])
             self.target_count = s["target_count"]
@@ -1355,12 +1448,23 @@ class PhotoCurator(QMainWindow):
         # ---------------------------------------------------------
         if self._full_loader and self._full_loader.isRunning():
             self._full_loader.cancel()
-            # 중요: 이전 로더의 finished 시그널이 현재 슬롯에 영향을 주지 않도록 연결 해제
             try:
                 self._full_loader.finished.disconnect()
             except TypeError:
                 pass
-            self._full_loader.wait(100)  # 짧은 대기
+            # 실행 중인 스레드가 종료될 때까지 Python 참조를 유지해야 함.
+            # self._full_loader = None 하면 GC가 즉시 소멸시켜 QThread fatal 발생.
+            # _pending_loaders에 보관하다가 finished 후 안전하게 정리.
+            old = self._full_loader
+            self._pending_loaders.append(old)
+            def _cleanup_loader(old=old):
+                try:
+                    self._pending_loaders.remove(old)
+                except ValueError:
+                    pass
+                old.deleteLater()
+            old.finished.connect(lambda *_: _cleanup_loader())
+            self._full_loader = None
 
         # ---------------------------------------------------------
         # 3단계: 비동기 고해상도 로딩 시작
@@ -1381,14 +1485,25 @@ class PhotoCurator(QMainWindow):
         # 버튼 상태 및 큐 스크롤
         if sel:
             self.btn_toggle.setText("♥ 선택 해제 (Space)")
-            self.btn_toggle.setStyleSheet("QPushButton{background:#c0392b;border-color:#e74c3c;font-size:18px}")
+            self.btn_toggle.setStyleSheet(
+                "QPushButton{background:#c0392b;color:white;"
+                "border:1px solid #e74c3c;border-radius:6px;font-size:12px;font-weight:bold;padding:2px 14px}"
+                "QPushButton:hover{background:#e74c3c}")
         else:
             self.btn_toggle.setText("♡ 선택 (Space)")
-            self.btn_toggle.setStyleSheet("QPushButton{background:#27ae60;border-color:#2ecc71;font-size:18px}")
+            self.btn_toggle.setStyleSheet(
+                "QPushButton{background:#27ae60;color:white;"
+                "border:1px solid #2ecc71;border-radius:6px;font-size:12px;font-weight:bold;padding:2px 14px}"
+                "QPushButton:hover{background:#2ecc71}")
 
         self._update_queue_states()
         self._scroll_queue_to_current()
         self._update_curator_ui()
+        self._nav_debounce_timer.start(300)
+
+    def _on_nav_debounced(self):
+        """키 연속 입력이 멈춘 뒤 300ms 후에 한 번만 실행 (썸네일 프리로드 + 세션 저장)"""
+        self._preload_all_thumbs(self.current_index)
         self._save_session()
 
     # [추가된 콜백 함수]
@@ -1434,10 +1549,16 @@ class PhotoCurator(QMainWindow):
         # 2. 선택 버튼 스타일 업데이트
         if sel:
             self.btn_toggle.setText("♥ 선택 해제 (Space)")
-            self.btn_toggle.setStyleSheet("QPushButton{background:#c0392b; border-color:#e74c3c; font-size:18px}")
+            self.btn_toggle.setStyleSheet(
+                "QPushButton{background:#c0392b;color:white;"
+                "border:1px solid #e74c3c;border-radius:6px;font-size:12px;font-weight:bold;padding:2px 14px}"
+                "QPushButton:hover{background:#e74c3c}")
         else:
             self.btn_toggle.setText("♡ 선택 (Space)")
-            self.btn_toggle.setStyleSheet("QPushButton{background:#27ae60; border-color:#2ecc71; font-size:18px}")
+            self.btn_toggle.setStyleSheet(
+                "QPushButton{background:#27ae60;color:white;"
+                "border:1px solid #2ecc71;border-radius:6px;font-size:12px;font-weight:bold;padding:2px 14px}"
+                "QPushButton:hover{background:#2ecc71}")
 
         # 3. 하단 큐와 상단 정보 바 갱신
         self._update_queue_states()
